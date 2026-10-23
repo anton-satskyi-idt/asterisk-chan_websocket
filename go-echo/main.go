@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,7 +46,27 @@ type event struct {
 	Ptime            int               `json:"ptime"`
 	Digit            string            `json:"digit"`
 	ChannelVariables map[string]string `json:"channel_variables"`
+	// TRANSFER_RESULT / TRANSFER_PROGRESS (n2p-asterisk websocket-transfer patch)
+	CorrelationID string `json:"correlation_id"`
+	Status        string `json:"status"`
+	Cause         string `json:"cause"`
+	State         string `json:"state"`
 }
+
+// transferCommand is the chan_websocket TRANSFER command (cold transfer).
+type transferCommand struct {
+	Command       string `json:"command"`
+	CorrelationID string `json:"correlation_id"`
+	Exten         string `json:"exten"`
+	Context       string `json:"context"`
+}
+
+// Transfer target for DTMF 0 / TRANSFER_AFTER; the context must be in chan_websocket.conf transfer_contexts.
+var (
+	transferExten   = "601"
+	transferContext = "internal"
+	transferAfter   time.Duration // 0 = off
+)
 
 // mediaStats accumulates per-interval media statistics (debug level only).
 type mediaStats struct {
@@ -162,6 +183,26 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var connectionID string
+	transfers := 0
+	sendTransfer := func() {
+		transfers++
+		cmd := transferCommand{
+			Command:       "TRANSFER",
+			CorrelationID: "xfer-" + connectionID + "-" + strconv.Itoa(transfers),
+			Exten:         transferExten,
+			Context:       transferContext,
+		}
+		msg, _ := json.Marshal(cmd)
+		log.Info("transferring", "exten", cmd.Exten, "context", cmd.Context, "correlation_id", cmd.CorrelationID)
+		log.Log(ctx, levelTrace, "send command", "msg", string(msg))
+		if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			log.Warn("send command", "command", cmd.Command, "err", err)
+		}
+	}
+	// TRANSFER_AFTER fires on the read loop (the only writer) via the first frame after the deadline.
+	var transferAt time.Time
+
 	defer func() {
 		now := time.Now()
 		if debug && stats.frames > 0 {
@@ -203,6 +244,10 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 			switch ev.Event {
 			case "MEDIA_START":
 				log = log.With("channel", ev.Channel)
+				connectionID = ev.ConnectionID
+				if transferAfter > 0 {
+					transferAt = now.Add(transferAfter)
+				}
 				if ev.Ptime > 0 {
 					ptime = time.Duration(ev.Ptime) * time.Millisecond
 				}
@@ -221,6 +266,8 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 				case "#":
 					log.Info("hanging up on #")
 					sendCommand("HANGUP")
+				case "0":
+					sendTransfer()
 				case "*":
 					if debug {
 						sendCommand("GET_STATUS")
@@ -232,6 +279,16 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 			case "MEDIA_XON":
 				paused = false
 				log.Info("MEDIA_XON")
+			case "TRANSFER_RESULT":
+				// On success Asterisk closes the socket right after this event.
+				attrs := []any{"status", ev.Status, "cause", ev.Cause, "correlation_id", ev.CorrelationID}
+				if ev.Status == "success" {
+					log.Info("TRANSFER_RESULT", attrs...)
+				} else {
+					log.Warn("TRANSFER_RESULT", attrs...)
+				}
+			case "TRANSFER_PROGRESS":
+				log.Info("TRANSFER_PROGRESS", "state", ev.State, "correlation_id", ev.CorrelationID)
 			default:
 				// STATUS, QUEUE_DRAINED, MEDIA_MARK_PROCESSED, etc.
 				log.Debug("event", "name", ev.Event, "msg", string(data))
@@ -259,6 +316,11 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 				return
 			} else {
 				framesOut++
+			}
+
+			if !transferAt.IsZero() && !now.Before(transferAt) {
+				transferAt = time.Time{}
+				sendTransfer()
 			}
 
 			if debug && now.Sub(stats.intervalStart) >= statsInterval {
@@ -314,6 +376,18 @@ func main() {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			statsInterval = d
 		}
+	}
+
+	if v := os.Getenv("TRANSFER_AFTER"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			transferAfter = d
+		}
+	}
+	if v := os.Getenv("TRANSFER_EXTEN"); v != "" {
+		transferExten = v
+	}
+	if v := os.Getenv("TRANSFER_CONTEXT"); v != "" {
+		transferContext = v
 	}
 
 	addr := os.Getenv("LISTEN_ADDR")

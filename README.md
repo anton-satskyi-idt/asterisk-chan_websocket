@@ -11,7 +11,7 @@ softphone 1001 ──SIP/RTP──▶ asterisk ──ws://go-echo:8080/media─�
 
 | Service | Image | Notes |
 |---|---|---|
-| `asterisk` | `alpine:3.24` + `apk add asterisk asterisk-sounds-en` | Asterisk 22.9.0 from the Alpine repo; `chan_websocket` and `res_websocket_client` ship in the main package |
+| `asterisk` | `alpine:3.24`, built from source | [net2phone/n2p-asterisk](https://github.com/net2phone/n2p-asterisk) branch `websocket-transfer` ([PR #29](https://github.com/net2phone/n2p-asterisk/pull/29)): Asterisk 22.8.2 + chan_websocket `TRANSFER` command. pjproject/jansson come from the Alpine repo |
 | `go-echo` | `golang:1.24-alpine` → `alpine:3.24` | WebSocket server on `:8080/media`, `/healthz` for the compose healthcheck |
 
 ## Layout
@@ -19,10 +19,13 @@ softphone 1001 ──SIP/RTP──▶ asterisk ──ws://go-echo:8080/media─�
 docker-compose.yml
 asterisk/
   Dockerfile, entrypoint.sh     # entrypoint renders conf/ templates into /etc/asterisk
+  n2p-asterisk/                 # private fork checkout (gitignored), see Run
+  musl-patches/                 # musl fixes from Alpine aports main/asterisk
   conf/
     pjsip.conf                  # UDP 5060, endpoint 1001/1001, external_* = ${EXTERNAL_IP}
     rtp.conf                    # RTP 10000-10050 (published by compose)
     websocket_client.conf       # [go_echo] -> ws://go-echo:8080/media
+    chan_websocket.conf         # TRANSFER enabled, allowed context: internal
     extensions.conf             # 600, 601, smoke test
     asterisk.conf, modules.conf, logger.conf
 go-echo/
@@ -30,8 +33,10 @@ go-echo/
 ```
 
 ## Run
+The fork is private, so clone it next to the Dockerfile first (needs access to net2phone):
 ```sh
-EXTERNAL_IP=<host-LAN-IP> docker compose up -d --build
+git clone --depth 1 -b websocket-transfer https://github.com/net2phone/n2p-asterisk.git asterisk/n2p-asterisk
+EXTERNAL_IP=<host-LAN-IP> docker compose up -d --build   # first build compiles Asterisk, ~10 min
 ```
 - Files in `asterisk/conf/` are templates; `${EXTERNAL_IP}` is substituted at container start,
   so after editing them run `docker compose up -d --force-recreate asterisk`.
@@ -42,8 +47,8 @@ EXTERNAL_IP=<host-LAN-IP> docker compose up -d --build
 ## Extensions (context `internal`)
 | Ext | What it does |
 |---|---|
-| `600` | Echo through the Go service over chan_websocket. DTMF `#` → Go sends `HANGUP`; `*` → `GET_STATUS` (debug level) |
-| `601` | Asterisk built-in `Echo()`, for comparison |
+| `600` | Echo through the Go service over chan_websocket. DTMF `#` → Go sends `HANGUP`; `*` → `GET_STATUS` (debug level); `0` → Go sends `TRANSFER` to `601` |
+| `601` | Transfer target: plays `demo-congrats`, then Asterisk built-in `Echo()` |
 
 ## Test without a phone
 ```sh
@@ -54,9 +59,32 @@ docker compose logs -f go-echo
 `MEDIA_START ... format=ulaw optimal_frame_size=160 ptime=20`, then
 `disconnected ... frames_in=N frames_out=N` with equal counts.
 
+## Transfer from the Go service
+Go sends a cold transfer over the same websocket:
+```json
+{"command":"TRANSFER","correlation_id":"xfer-<connection_id>-1","exten":"601","context":"internal"}
+```
+Asterisk moves the caller (the channel bridged to the WebSocket channel) to `601@internal`,
+answers with `{"event":"TRANSFER_RESULT","status":"success",...}` and closes the socket.
+`invalid` / `not_permitted` / `failed` leave the caller with Go. Allowed contexts are set in
+`chan_websocket.conf` (`transfer_contexts`).
+
+| go-echo env | Default | Meaning |
+|---|---|---|
+| `TRANSFER_EXTEN` / `TRANSFER_CONTEXT` | `601` / `internal` | Transfer target |
+| `TRANSFER_AFTER` | off | e.g. `5s`: transfer every call this long after `MEDIA_START` |
+
+Phoneless test (the `xfer@smoke` leg presses `0` after 3 s):
+```sh
+docker compose exec asterisk asterisk -rx "channel originate Local/600@internal extension xfer@smoke"
+docker compose logs go-echo   # transferring ... TRANSFER_RESULT status=success ... disconnected
+```
+
 ## Test with a softphone
 1. Register `1001` / password `1001` to `<EXTERNAL_IP>:5060` (UDP).
 2. Dial `600` and speak — you should hear yourself.
+3. Press `0` — the call moves to `601` (Asterisk `Echo()`); you still hear yourself, and
+   `core show channels` no longer lists a `WebSocket/` channel.
 
 ## Go service logs (`LOG_LEVEL`)
 | Level | Adds |

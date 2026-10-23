@@ -4,6 +4,9 @@ services:
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}         # info | debug (media stats, STATUS) | trace (every frame)
       STATS_INTERVAL: ${STATS_INTERVAL:-5s} # debug: media stats + GET_STATUS period
+      TRANSFER_AFTER: ${TRANSFER_AFTER:-}   # e.g. 5s: TRANSFER every call this long after MEDIA_START
+      TRANSFER_EXTEN: ${TRANSFER_EXTEN:-601}
+      TRANSFER_CONTEXT: ${TRANSFER_CONTEXT:-internal}
     ports:
       - "8080:8080"
     healthcheck:
