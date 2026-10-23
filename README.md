@@ -37,6 +37,8 @@ The fork is private, so clone it next to the Dockerfile first (needs access to n
 ```sh
 git clone --depth 1 -b websocket-transfer https://github.com/net2phone/n2p-asterisk.git asterisk/n2p-asterisk
 EXTERNAL_IP=<host-LAN-IP> docker compose up -d --build   # first build compiles Asterisk, ~10 min
+# or, with go-echo transferring every call to 601 after 10 s (see "Transfer from the Go service"):
+TRANSFER_AFTER=10s EXTERNAL_IP=<host-LAN-IP> docker compose up -d --build
 ```
 - Files in `asterisk/conf/` are templates; `${EXTERNAL_IP}` is substituted at container start,
   so after editing them run `docker compose up -d --force-recreate asterisk`.
@@ -72,7 +74,19 @@ answers with `{"event":"TRANSFER_RESULT","status":"success",...}` and closes the
 | go-echo env | Default | Meaning |
 |---|---|---|
 | `TRANSFER_EXTEN` / `TRANSFER_CONTEXT` | `601` / `internal` | Transfer target |
-| `TRANSFER_AFTER` | off | e.g. `5s`: transfer every call this long after `MEDIA_START` |
+| `TRANSFER_AFTER` | off | e.g. `10s`: go-echo transfers every call by itself this long after `MEDIA_START` (no key press needed) |
+
+Start with the automatic transfer on (dial `600`, after 10 s you land on `601` and hear `demo-congrats`):
+```sh
+TRANSFER_AFTER=10s EXTERNAL_IP=<host-LAN-IP> docker compose up -d
+```
+Only `go-echo` reads it, so to switch it on or off later recreate just that service:
+```sh
+TRANSFER_AFTER=10s docker compose up -d go-echo   # on
+docker compose up -d go-echo                      # off (DTMF 0 still transfers)
+```
+To keep it on by default, put `TRANSFER_AFTER=10s` (and `EXTERNAL_IP=...`) in `.env` next to `docker-compose.yml`.
+The timer fires on the first audio frame after the deadline, so a muted phone is not transferred.
 
 Phoneless test (the `xfer@smoke` leg presses `0` after 3 s):
 ```sh
