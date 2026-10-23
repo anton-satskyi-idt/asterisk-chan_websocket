@@ -1,0 +1,27 @@
+services:
+  go-echo:
+    build: ./go-echo
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}         # info | debug (media stats, STATUS) | trace (every frame)
+      STATS_INTERVAL: ${STATS_INTERVAL:-5s} # debug: media stats + GET_STATUS period
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  asterisk:
+    build: ./asterisk
+    environment:
+      # LAN IP of the Docker host, advertised in SIP/SDP so softphones can reach RTP.
+      EXTERNAL_IP: ${EXTERNAL_IP:-127.0.0.1}
+    volumes:
+      - ./asterisk/conf:/etc/asterisk-templates:ro
+    ports:
+      - "5060:5060/udp"
+      - "10000-10050:10000-10050/udp"
+    depends_on:
+      go-echo:
+        condition: service_healthy
