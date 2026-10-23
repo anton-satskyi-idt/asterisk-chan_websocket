@@ -9,6 +9,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,20 +54,53 @@ type event struct {
 	State         string `json:"state"`
 }
 
-// transferCommand is the chan_websocket TRANSFER command (cold transfer).
+// transferCommand is the chan_websocket TRANSFER command. Type is omitted for cold;
+// RingTimeout and Hold apply to warm only.
 type transferCommand struct {
 	Command       string `json:"command"`
 	CorrelationID string `json:"correlation_id"`
+	Type          string `json:"type,omitempty"`
 	Exten         string `json:"exten"`
 	Context       string `json:"context"`
+	RingTimeout   int    `json:"ring_timeout,omitempty"`
+	Hold          bool   `json:"hold,omitempty"`
 }
 
 // Transfer target for DTMF 0 / TRANSFER_AFTER; the context must be in chan_websocket.conf transfer_contexts.
 var (
-	transferExten   = "601"
-	transferContext = "internal"
-	transferAfter   time.Duration // 0 = off
+	transferExten       = "601"
+	transferContext     = "internal"
+	transferAfter       time.Duration // 0 = off
+	transferWarm        bool          // TRANSFER_TYPE=warm
+	transferRingTimeout = 20          // seconds, warm only
+	transferHold        = true        // warm only: Asterisk plays music on hold while it rings
 )
+
+// warmTestTargets maps DTMF digits to warm-transfer test extensions (extensions.conf).
+var warmTestTargets = map[string]string{
+	"1": "601", // answers after ringing
+	"2": "602", // busy
+	"3": "603", // never answers: no_answer after the ring timeout
+	"4": "604", // unavailable
+}
+
+// beepFrames is two short 1 kHz beeps as 20 ms µ-law frames, played to the caller
+// when a transfer fails and the call is back with us.
+var beepFrames = func() [][]byte {
+	var frames [][]byte
+	for _, on := range []bool{true, true, true, true, true, false, false, false, false, false, true, true, true, true, true} {
+		f := make([]byte, 160)
+		for i := range f {
+			v := 0.0
+			if on {
+				v = 8000 * math.Sin(2*math.Pi*1000*float64(len(frames)*160+i)/8000)
+			}
+			f[i] = linearToUlaw(int16(v))
+		}
+		frames = append(frames, f)
+	}
+	return frames
+}()
 
 // mediaStats accumulates per-interval media statistics (debug level only).
 type mediaStats struct {
@@ -183,23 +217,34 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var connectionID string
+	var channelID string
 	transfers := 0
-	sendTransfer := func() {
+	sendJSON := func(cmd any, name string) {
+		msg, _ := json.Marshal(cmd)
+		log.Log(ctx, levelTrace, "send command", "msg", string(msg))
+		if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			log.Warn("send command", "command", name, "err", err)
+		}
+	}
+	sendTransfer := func(exten string, warm bool) {
 		transfers++
 		cmd := transferCommand{
 			Command:       "TRANSFER",
-			CorrelationID: "xfer-" + connectionID + "-" + strconv.Itoa(transfers),
-			Exten:         transferExten,
+			CorrelationID: "xfer-" + channelID + "-" + strconv.Itoa(transfers),
+			Exten:         exten,
 			Context:       transferContext,
 		}
-		msg, _ := json.Marshal(cmd)
-		log.Info("transferring", "exten", cmd.Exten, "context", cmd.Context, "correlation_id", cmd.CorrelationID)
-		log.Log(ctx, levelTrace, "send command", "msg", string(msg))
-		if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			log.Warn("send command", "command", cmd.Command, "err", err)
+		if warm {
+			cmd.Type = "warm"
+			cmd.RingTimeout = transferRingTimeout
+			cmd.Hold = transferHold
 		}
+		log.Info("transferring", "type", cmp.Or(cmd.Type, "cold"), "exten", cmd.Exten, "context", cmd.Context,
+			"correlation_id", cmd.CorrelationID)
+		sendJSON(cmd, cmd.Command)
 	}
+	// Frames left of beepFrames to play instead of the echo (failed transfer).
+	beepAt := len(beepFrames)
 	// TRANSFER_AFTER fires on the read loop (the only writer) via the first frame after the deadline.
 	var transferAt time.Time
 
@@ -244,7 +289,7 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 			switch ev.Event {
 			case "MEDIA_START":
 				log = log.With("channel", ev.Channel)
-				connectionID = ev.ConnectionID
+				channelID = ev.ChannelID
 				if transferAfter > 0 {
 					transferAt = now.Add(transferAfter)
 				}
@@ -267,7 +312,12 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 					log.Info("hanging up on #")
 					sendCommand("HANGUP")
 				case "0":
-					sendTransfer()
+					sendTransfer(transferExten, transferWarm)
+				case "1", "2", "3", "4":
+					sendTransfer(warmTestTargets[ev.Digit], true)
+				case "9":
+					log.Info("cancelling transfer")
+					sendJSON(map[string]string{"command": "TRANSFER_CANCEL"}, "TRANSFER_CANCEL")
 				case "*":
 					if debug {
 						sendCommand("GET_STATUS")
@@ -285,7 +335,9 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 				if ev.Status == "success" {
 					log.Info("TRANSFER_RESULT", attrs...)
 				} else {
-					log.Warn("TRANSFER_RESULT", attrs...)
+					// The caller is still with us: beep, then keep echoing.
+					log.Warn("TRANSFER_RESULT, call is back", attrs...)
+					beepAt = 0
 				}
 			case "TRANSFER_PROGRESS":
 				log.Info("TRANSFER_PROGRESS", "state", ev.State, "correlation_id", ev.CorrelationID)
@@ -307,9 +359,14 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 				log.Log(ctx, levelTrace, "frame", "n", framesIn, "bytes", len(data))
 			}
 
+			out := data
+			if beepAt < len(beepFrames) {
+				out = beepFrames[beepAt]
+				beepAt++
+			}
 			if paused {
 				dropped++
-			} else if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+			} else if err := conn.WriteMessage(websocket.BinaryMessage, out); err != nil {
 				// Frames arrive paced at ptime and sized at optimal_frame_size,
 				// so echoing them 1:1 keeps both size and timing valid.
 				log.Warn("write", "err", err)
@@ -320,7 +377,7 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 
 			if !transferAt.IsZero() && !now.Before(transferAt) {
 				transferAt = time.Time{}
-				sendTransfer()
+				sendTransfer(transferExten, transferWarm)
 			}
 
 			if debug && now.Sub(stats.intervalStart) >= statsInterval {
@@ -344,6 +401,23 @@ func ulawToLinear(u byte) int16 {
 		return int16(-sample)
 	}
 	return int16(sample)
+}
+
+// linearToUlaw encodes one 16-bit linear sample as G.711 mu-law.
+func linearToUlaw(s int16) byte {
+	const bias, clip = 0x84, 32635
+	v := int(s)
+	sign := 0
+	if v < 0 {
+		v, sign = -v, 0x80
+	}
+	v = min(v, clip) + bias
+	exponent := 7
+	for mask := 0x4000; v&mask == 0 && exponent > 0; mask >>= 1 {
+		exponent--
+	}
+	mantissa := (v >> (exponent + 3)) & 0x0F
+	return ^byte(sign | exponent<<4 | mantissa)
 }
 
 func dbfs(v float64) float64 {
@@ -388,6 +462,13 @@ func main() {
 	}
 	if v := os.Getenv("TRANSFER_CONTEXT"); v != "" {
 		transferContext = v
+	}
+	transferWarm = strings.EqualFold(os.Getenv("TRANSFER_TYPE"), "warm")
+	if n, err := strconv.Atoi(os.Getenv("TRANSFER_RING_TIMEOUT")); err == nil && n > 0 {
+		transferRingTimeout = n
+	}
+	if b, err := strconv.ParseBool(os.Getenv("TRANSFER_HOLD")); err == nil {
+		transferHold = b
 	}
 
 	addr := os.Getenv("LISTEN_ADDR")

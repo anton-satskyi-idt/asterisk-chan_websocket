@@ -7,6 +7,9 @@ services:
       TRANSFER_AFTER: ${TRANSFER_AFTER:-}   # e.g. 5s: TRANSFER every call this long after MEDIA_START
       TRANSFER_EXTEN: ${TRANSFER_EXTEN:-601}
       TRANSFER_CONTEXT: ${TRANSFER_CONTEXT:-internal}
+      TRANSFER_TYPE: ${TRANSFER_TYPE:-cold}               # cold | warm (DTMF 0 and TRANSFER_AFTER)
+      TRANSFER_RING_TIMEOUT: ${TRANSFER_RING_TIMEOUT:-20} # warm: seconds, 5..60
+      TRANSFER_HOLD: ${TRANSFER_HOLD:-true}               # warm: music on hold while it rings
     ports:
       - "8080:8080"
     healthcheck:

@@ -49,8 +49,9 @@ TRANSFER_AFTER=10s EXTERNAL_IP=<host-LAN-IP> docker compose up -d --build
 ## Extensions (context `internal`)
 | Ext | What it does |
 |---|---|
-| `600` | Echo through the Go service over chan_websocket. DTMF `#` → Go sends `HANGUP`; `*` → `GET_STATUS` (debug level); `0` → Go sends `TRANSFER` to `601` |
-| `601` | Transfer target: plays `demo-congrats`, then Asterisk built-in `Echo()` |
+| `600` | Echo through the Go service over chan_websocket. DTMF `#` → Go sends `HANGUP`; `*` → `GET_STATUS` (debug level); `0` → Go sends `TRANSFER` to `601`; `1`-`4` warm transfer tests, `9` cancel (see Warm transfer) |
+| `601` | Transfer target: rings 3 s, plays `demo-congrats`, then Asterisk built-in `Echo()` |
+| `602`-`604` | Warm transfer failure targets: busy, never answers, unreachable |
 
 ## Test without a phone
 ```sh
@@ -64,7 +65,7 @@ docker compose logs -f go-echo
 ## Transfer from the Go service
 Go sends a cold transfer over the same websocket:
 ```json
-{"command":"TRANSFER","correlation_id":"xfer-<connection_id>-1","exten":"601","context":"internal"}
+{"command":"TRANSFER","correlation_id":"xfer-<channel_id>-1","exten":"601","context":"internal"}
 ```
 Asterisk moves the caller (the channel bridged to the WebSocket channel) to `601@internal`,
 answers with `{"event":"TRANSFER_RESULT","status":"success",...}` and closes the socket.
@@ -75,6 +76,9 @@ answers with `{"event":"TRANSFER_RESULT","status":"success",...}` and closes the
 |---|---|---|
 | `TRANSFER_EXTEN` / `TRANSFER_CONTEXT` | `601` / `internal` | Transfer target |
 | `TRANSFER_AFTER` | off | e.g. `10s`: go-echo transfers every call by itself this long after `MEDIA_START` (no key press needed) |
+| `TRANSFER_TYPE` | `cold` | `warm`: DTMF `0` and `TRANSFER_AFTER` send warm transfers |
+| `TRANSFER_RING_TIMEOUT` | `20` | Warm: seconds the target may ring (5..60) |
+| `TRANSFER_HOLD` | `true` | Warm: caller hears music on hold while it rings; `false` keeps the echo |
 
 Start with the automatic transfer on (dial `600`, after 10 s you land on `601` and hear `demo-congrats`):
 ```sh
@@ -93,6 +97,31 @@ Phoneless test (the `xfer@smoke` leg presses `0` after 3 s):
 docker compose exec asterisk asterisk -rx "channel originate Local/600@internal extension xfer@smoke"
 docker compose logs go-echo   # transferring ... TRANSFER_RESULT status=success ... disconnected
 ```
+
+## Warm transfer (call comes back on failure)
+With `"type":"warm"` Asterisk dials the target while the caller **stays with go-echo**
+(hearing music on hold, or still the echo with `TRANSFER_HOLD=false`). Only when the target
+answers is the caller handed over. If it fails, `TRANSFER_RESULT` reports why, the caller is
+still with go-echo, and go-echo plays two beeps and keeps echoing.
+```json
+{"command":"TRANSFER","correlation_id":"xfer-<channel_id>-1","type":"warm","exten":"602","context":"internal","ring_timeout":20}
+```
+During a call to `600`, press:
+
+| Key | Target | Expected `TRANSFER_RESULT` | You hear |
+|---|---|---|---|
+| `1` | `601` rings 3 s, answers | `success` | echo, then `demo-congrats` from 601 |
+| `2` | `602` rings 3 s, busy | `busy` (cause 17) | echo, beep-beep, echo again |
+| `3` | `603` never answers | `no_answer` (cause 19) after the ring timeout | echo, beep-beep, echo again |
+| `4` | `604` unreachable | `unavailable` (cause 1) | beep-beep right away |
+| `9` | | cancels a ringing warm transfer: `cancelled` | beep-beep, echo again |
+
+Progress shows up as `TRANSFER_PROGRESS state=trying|ringing`. Phoneless:
+```sh
+docker compose exec asterisk asterisk -rx "channel originate Local/600@internal extension warm2@smoke"   # warm1..warm4
+docker compose logs go-echo | grep TRANSFER
+```
+Warm transfers are enabled in `chan_websocket.conf` (`transfer_warm_enabled`, `transfer_max_ring_timeout`).
 
 ## Test with a softphone
 1. Register `1001` / password `1001` to `<EXTERNAL_IP>:5060` (UDP).
